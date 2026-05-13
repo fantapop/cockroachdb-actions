@@ -47,6 +47,11 @@ func Run(ctx context.Context, cfg *config.Config, runner claude.Runner, tmpDir s
 		OutputFile:   outputFile,
 		ContextVars:  cfg.ContextVars,
 		LogLevel:     cfg.LogLevel,
+		Sandbox: &claude.SandboxOptions{
+			WorkingDir: cfg.WorkingDir,
+			ScratchDir: cfg.ScratchDir,
+			ReadPaths:  cfg.ReadPaths,
+		},
 	})
 	if cfg.LogLevel != "error" {
 		action.EndLogGroup()

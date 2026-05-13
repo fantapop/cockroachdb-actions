@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/cockroachdb/actions/autosolve/internal/action"
@@ -38,6 +39,25 @@ type RunOptions struct {
 	OutputFile   string   // path to write JSON output
 	ContextVars  []string // env var names to pass through to the Claude subprocess
 	LogLevel     string   // "error", "info", or "debug" — controls real-time streaming to stderr
+
+	// Sandbox, when set, wraps the claude subprocess in a bubblewrap
+	// filesystem sandbox. The sandbox denies access to anything not
+	// explicitly bound. Linux only — non-empty Sandbox on other platforms
+	// returns an error from Run.
+	Sandbox *SandboxOptions
+}
+
+// SandboxOptions describes the bubblewrap bind layout for one invocation.
+type SandboxOptions struct {
+	// WorkingDir is bound read-write and used as Claude's cwd inside the
+	// sandbox. Required.
+	WorkingDir string
+	// ScratchDir is bound read-write. Its home/ subdirectory is used as
+	// HOME so claude session state persists across retry attempts.
+	// Required.
+	ScratchDir string
+	// ReadPaths are extra host paths bound read-only.
+	ReadPaths []string
 }
 
 // BaselineEnvVars are environment variables always passed to the Claude CLI
@@ -66,6 +86,13 @@ var BaselineEnvVars = []string{
 	"RUNNER_TEMP",
 	"GITHUB_WORKSPACE",
 	"GITHUB_REPOSITORY",
+
+	// Autosolve coordination paths (set by the implement subcommand;
+	// claude reads them with printenv to know where to write the
+	// commit message and PR body so they live outside the repo and
+	// can't be accidentally staged).
+	"AUTOSOLVE_COMMIT_MESSAGE_PATH",
+	"AUTOSOLVE_PR_BODY_PATH",
 }
 
 // Result holds parsed Claude CLI output.
@@ -258,7 +285,17 @@ func (r *CLIRunner) Run(ctx context.Context, opts RunOptions) (*Result, error) {
 		return nil, fmt.Errorf("Prompt and PromptFile are mutually exclusive")
 	}
 
-	cmd := exec.CommandContext(ctx, "claude", args...)
+	binary := "claude"
+	if opts.Sandbox != nil {
+		wrapped, err := wrapWithBwrap(binary, args, opts.Sandbox)
+		if err != nil {
+			return nil, fmt.Errorf("setting up sandbox: %w", err)
+		}
+		binary = "bwrap"
+		args = wrapped
+	}
+
+	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Env = buildEnv(opts.ContextVars)
 	cmd.Stderr = os.Stderr
 
@@ -525,6 +562,132 @@ func (s *streamLogger) processLine(line []byte) {
 			action.LogInfo(string(line))
 		}
 	}
+}
+
+// wrapWithBwrap returns the bwrap argv that runs `target targetArgs...`
+// inside a deny-by-default filesystem sandbox. The caller (action.yml
+// setup step) is responsible for installing bubblewrap and enabling
+// unprivileged user namespaces; we surface a clear error here rather
+// than failing later inside bwrap.
+//
+// `target` is resolved on PATH and via symlinks so the absolute binary
+// path can be passed inside the sandbox (PATH lookup inside is unreliable
+// because HOME and many user dirs are not bound). If the resolved path
+// lies outside the always-bound system directories, it is bound RO so
+// bwrap can exec it.
+func wrapWithBwrap(target string, targetArgs []string, sb *SandboxOptions) ([]string, error) {
+	if runtime.GOOS != "linux" {
+		return nil, fmt.Errorf("sandbox is only supported on linux (got %s)", runtime.GOOS)
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		return nil, fmt.Errorf("bubblewrap not found on PATH: %w (the action's setup step should install it)", err)
+	}
+	if sb.WorkingDir == "" {
+		return nil, fmt.Errorf("sandbox WorkingDir is required")
+	}
+	if sb.ScratchDir == "" {
+		return nil, fmt.Errorf("sandbox ScratchDir is required")
+	}
+
+	resolved, err := exec.LookPath(target)
+	if err != nil {
+		return nil, fmt.Errorf("locating %q on PATH: %w", target, err)
+	}
+	resolved, err = filepath.EvalSymlinks(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("resolving symlinks for %q: %w", target, err)
+	}
+
+	var extraBinds []string
+	if !pathUnderAny(resolved, alwaysBoundPaths) {
+		extraBinds = append(extraBinds, resolved)
+	}
+
+	return buildBwrapArgs(sb, resolved, targetArgs, extraBinds), nil
+}
+
+// alwaysBoundPaths are the host directories buildBwrapArgs always binds
+// (when present). A binary whose resolved path lies under one of these
+// does not need an extra bind.
+var alwaysBoundPaths = []string{"/usr", "/etc", "/lib", "/lib64", "/opt"}
+
+func pathUnderAny(p string, roots []string) bool {
+	for _, r := range roots {
+		if p == r || strings.HasPrefix(p, r+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildBwrapArgs constructs the bubblewrap argv. Split out from
+// wrapWithBwrap so it is testable without bwrap on PATH.
+//
+// Layout inside the sandbox:
+//   - WorkingDir bound read-write at the same host path; used as cwd.
+//   - ScratchDir bound read-write at the same host path; HOME points
+//     to its home/ subdir so claude session state persists across
+//     retry invocations within the same workflow run.
+//   - ReadPaths bound read-only.
+//   - /usr, /etc, and (when present) /lib, /lib64, /opt are read-only.
+//   - /run/systemd/resolve is bound RO (when present) so glibc can
+//     follow /etc/resolv.conf into the systemd-resolved stub for DNS.
+//     We deliberately avoid binding all of /run, which on GHA hosted
+//     runners contains /run/docker.sock — a sandbox-escape vector
+//     because the runner user is in the docker group.
+//   - /proc, /dev, and /tmp are isolated.
+//   - --share-net keeps the host network namespace; avoids the
+//     RTM_NEWADDR failure AppArmor causes for unprivileged network
+//     namespaces on Ubuntu 24.04+ runners.
+//
+// GITHUB_WORKSPACE and RUNNER_TEMP are intentionally NOT bound — only
+// the paths the caller listed are visible. Other actions sometimes drop
+// credential files into GITHUB_WORKSPACE (e.g. gha-creds-*.json), so
+// denying them by default is the whole point of the sandbox.
+func buildBwrapArgs(
+	sb *SandboxOptions, target string, targetArgs []string, extraBinds []string,
+) []string {
+	args := []string{
+		"--share-net",
+		"--die-with-parent",
+		"--proc", "/proc",
+		"--dev", "/dev",
+		"--tmpfs", "/tmp",
+		"--ro-bind", "/usr", "/usr",
+		"--ro-bind", "/etc", "/etc",
+	}
+	for _, p := range []string{"/lib", "/lib64", "/opt"} {
+		if _, err := os.Stat(p); err == nil {
+			args = append(args, "--ro-bind", p, p)
+		}
+	}
+	// /run/systemd/resolve holds stub-resolv.conf (the symlink target
+	// of /etc/resolv.conf on systemd-resolved hosts). Bind only this
+	// subdirectory rather than all of /run to keep /run/docker.sock
+	// out of reach: the GHA runner user is in the docker group, so
+	// exposing the socket would be a sandbox-escape vector.
+	if _, err := os.Stat("/run/systemd/resolve"); err == nil {
+		args = append(args, "--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve")
+	}
+	args = append(args,
+		"--bind", sb.WorkingDir, sb.WorkingDir,
+		"--bind", sb.ScratchDir, sb.ScratchDir,
+	)
+	for _, p := range sb.ReadPaths {
+		args = append(args, "--ro-bind", p, p)
+	}
+	for _, p := range extraBinds {
+		args = append(args, "--ro-bind", p, p)
+	}
+	home := filepath.Join(sb.ScratchDir, "home")
+	args = append(args,
+		"--chdir", sb.WorkingDir,
+		"--setenv", "HOME", home,
+		"--",
+		target,
+	)
+	args = append(args, targetArgs...)
+	return args
 }
 
 // buildEnv constructs an explicit environment for the Claude CLI subprocess.

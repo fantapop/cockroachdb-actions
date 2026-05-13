@@ -52,10 +52,17 @@ func (m *mockRunner) Run(ctx context.Context, opts claude.RunOptions) (*claude.R
 	data, _ := json.Marshal(out)
 	os.WriteFile(opts.OutputFile, data, 0644)
 
-	// Simulate Claude writing metadata files on implementation success
+	// Simulate Claude writing metadata files on implementation success.
+	// Implement.Run sets these env vars to the scratch paths before
+	// invoking the runner, mirroring how the real claude subprocess
+	// would discover them via printenv.
 	if strings.Contains(resultText, "IMPLEMENTATION_RESULT - SUCCESS") {
-		os.WriteFile(".autosolve-commit-message", []byte("fix: mock commit"), 0644)
-		os.WriteFile(".autosolve-pr-body", []byte("Mock PR body."), 0644)
+		if p := os.Getenv("AUTOSOLVE_COMMIT_MESSAGE_PATH"); p != "" {
+			os.WriteFile(p, []byte("fix: mock commit"), 0644)
+		}
+		if p := os.Getenv("AUTOSOLVE_PR_BODY_PATH"); p != "" {
+			os.WriteFile(p, []byte("Mock PR body."), 0644)
+		}
 	}
 
 	result := &claude.Result{
@@ -122,17 +129,8 @@ func init() {
 	RetryDelay = 0 * time.Millisecond
 }
 
-func cleanupAutosolveFiles(t *testing.T) {
-	t.Helper()
-	t.Cleanup(func() {
-		os.Remove(".autosolve-commit-message")
-		os.Remove(".autosolve-pr-body")
-	})
-}
-
 func TestRun_Success(t *testing.T) {
 	tmpDir := t.TempDir()
-	cleanupAutosolveFiles(t)
 	t.Setenv("GITHUB_OUTPUT", tmpDir+"/output")
 	t.Setenv("GITHUB_STEP_SUMMARY", tmpDir+"/summary")
 
@@ -146,6 +144,7 @@ func TestRun_Success(t *testing.T) {
 		ForkRepo:     "testrepo",
 		BranchPrefix: "autosolve/",
 		PRBaseBranch: "main",
+		ScratchDir:   tmpDir,
 	}
 
 	runner := &mockRunner{
@@ -167,7 +166,6 @@ func TestRun_Success(t *testing.T) {
 
 func TestRun_RetryThenSuccess(t *testing.T) {
 	tmpDir := t.TempDir()
-	cleanupAutosolveFiles(t)
 	t.Setenv("GITHUB_OUTPUT", tmpDir+"/output")
 	t.Setenv("GITHUB_STEP_SUMMARY", tmpDir+"/summary")
 
@@ -181,6 +179,7 @@ func TestRun_RetryThenSuccess(t *testing.T) {
 		ForkRepo:     "testrepo",
 		BranchPrefix: "autosolve/",
 		PRBaseBranch: "main",
+		ScratchDir:   tmpDir,
 	}
 
 	runner := &mockRunner{
@@ -217,6 +216,7 @@ func TestRun_AllRetriesFail(t *testing.T) {
 		ForkRepo:     "testrepo",
 		BranchPrefix: "autosolve/",
 		PRBaseBranch: "main",
+		ScratchDir:   tmpDir,
 	}
 
 	runner := &mockRunner{
@@ -265,21 +265,20 @@ func TestWriteOutputs(t *testing.T) {
 }
 
 func TestReadCommitMessage(t *testing.T) {
-	dir := t.TempDir()
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	t.Cleanup(func() { os.Chdir(orig) })
+	scratch := t.TempDir()
+	cfg := &config.Config{ScratchDir: scratch}
+	path := commitMessagePath(cfg)
 
 	t.Run("missing file returns error", func(t *testing.T) {
-		_, _, err := readCommitMessage()
+		_, _, err := readCommitMessage(cfg)
 		if err == nil {
 			t.Error("expected error when file is missing")
 		}
 	})
 
 	t.Run("subject only", func(t *testing.T) {
-		os.WriteFile(".autosolve-commit-message", []byte("fix: broken build"), 0644)
-		subject, body, err := readCommitMessage()
+		os.WriteFile(path, []byte("fix: broken build"), 0644)
+		subject, body, err := readCommitMessage(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -292,8 +291,8 @@ func TestReadCommitMessage(t *testing.T) {
 	})
 
 	t.Run("subject and body", func(t *testing.T) {
-		os.WriteFile(".autosolve-commit-message", []byte("fix: broken build\n\nDetailed explanation here."), 0644)
-		subject, body, err := readCommitMessage()
+		os.WriteFile(path, []byte("fix: broken build\n\nDetailed explanation here."), 0644)
+		subject, body, err := readCommitMessage(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -306,9 +305,9 @@ func TestReadCommitMessage(t *testing.T) {
 	})
 
 	t.Run("file is removed after read", func(t *testing.T) {
-		os.WriteFile(".autosolve-commit-message", []byte("subject"), 0644)
-		readCommitMessage()
-		if _, err := os.Stat(".autosolve-commit-message"); !os.IsNotExist(err) {
+		os.WriteFile(path, []byte("subject"), 0644)
+		_, _, _ = readCommitMessage(cfg)
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Error("expected file to be removed after read")
 		}
 	})

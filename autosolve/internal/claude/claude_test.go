@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -379,6 +380,139 @@ func TestBuildEnv_UnsetContextVar(t *testing.T) {
 	if _, ok := envMap["NONEXISTENT_VAR"]; ok {
 		t.Error("unset context var should not appear in env")
 	}
+}
+
+func TestBuildBwrapArgs(t *testing.T) {
+	sb := &SandboxOptions{
+		WorkingDir: "/work/repo",
+		ScratchDir: "/runner/temp/autosolve-scratch",
+		ReadPaths:  []string{"/share/protos", "/share/schemas"},
+	}
+
+	extra := []string{"/home/runner/.local/bin/claude"}
+	args := buildBwrapArgs(sb, "/home/runner/.local/bin/claude",
+		[]string{"--print", "--model", "x"}, extra)
+
+	// Working dir must be bound RW and used as cwd.
+	if !argSeq(args, "--bind", "/work/repo", "/work/repo") {
+		t.Errorf("expected RW bind for working dir; got %v", args)
+	}
+	if !argSeq(args, "--chdir", "/work/repo") {
+		t.Errorf("expected --chdir to working dir; got %v", args)
+	}
+
+	// Scratch dir must be bound RW; HOME must point at its home/ subdir.
+	if !argSeq(args, "--bind", "/runner/temp/autosolve-scratch", "/runner/temp/autosolve-scratch") {
+		t.Errorf("expected RW bind for scratch dir; got %v", args)
+	}
+	if !argSeq(args, "--setenv", "HOME", "/runner/temp/autosolve-scratch/home") {
+		t.Errorf("expected HOME under scratch dir; got %v", args)
+	}
+
+	// Read paths must be bound RO.
+	for _, p := range sb.ReadPaths {
+		if !argSeq(args, "--ro-bind", p, p) {
+			t.Errorf("expected RO bind for %q; got %v", p, args)
+		}
+	}
+
+	// /run/systemd/resolve must be bound RO when present so DNS works
+	// (/etc/resolv.conf is a symlink into /run/systemd/resolve/).
+	// We must NOT bind /run wholesale — it would expose /run/docker.sock.
+	if _, err := os.Stat("/run/systemd/resolve"); err == nil {
+		if !argSeq(args, "--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve") {
+			t.Errorf("expected RO bind for /run/systemd/resolve; got %v", args)
+		}
+	}
+	if argSeq(args, "--ro-bind", "/run", "/run") {
+		t.Errorf("must not bind all of /run (would expose docker.sock); got %v", args)
+	}
+
+	// GITHUB_WORKSPACE / RUNNER_TEMP must NOT be bound just because
+	// they appear in the env — only the listed paths are visible.
+	for _, denied := range []string{"/github/workspace", "/runner/temp"} {
+		if argSeq(args, "--bind", denied, denied) {
+			t.Errorf("unexpected bind for %q; sandbox should deny by default. got %v", denied, args)
+		}
+	}
+
+	// --share-net is required: avoids RTM_NEWADDR failure on Ubuntu 24.04+.
+	if !slices.Contains(args, "--share-net") {
+		t.Errorf("expected --share-net; got %v", args)
+	}
+
+	// /tmp must be tmpfs (private + writable + per-invocation).
+	if !argSeq(args, "--tmpfs", "/tmp") {
+		t.Errorf("expected tmpfs /tmp; got %v", args)
+	}
+
+	// The wrapped target and its argv come last after `--`.
+	dashIdx := -1
+	for i, a := range args {
+		if a == "--" {
+			dashIdx = i
+			break
+		}
+	}
+	if dashIdx < 0 {
+		t.Fatalf("expected -- separator; got %v", args)
+	}
+	tail := args[dashIdx+1:]
+	want := []string{"/home/runner/.local/bin/claude", "--print", "--model", "x"}
+	if len(tail) != len(want) {
+		t.Fatalf("expected tail %v; got %v", want, tail)
+	}
+	for i := range want {
+		if tail[i] != want[i] {
+			t.Errorf("tail[%d] = %q, want %q", i, tail[i], want[i])
+		}
+	}
+
+	// extraBinds (typically the resolved claude binary) must be RO-bound
+	// so bwrap can exec it from outside the always-bound system dirs.
+	if !argSeq(args, "--ro-bind", "/home/runner/.local/bin/claude", "/home/runner/.local/bin/claude") {
+		t.Errorf("expected RO bind for extra binary path; got %v", args)
+	}
+}
+
+func TestPathUnderAny(t *testing.T) {
+	roots := []string{"/usr", "/lib"}
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/usr", true},
+		{"/usr/local/bin/claude", true},
+		{"/lib/x86_64-linux-gnu/libc.so", true},
+		{"/home/runner/.local/bin/claude", false},
+		{"/usrlocal", false}, // prefix must be followed by separator
+		{"/", false},
+	}
+	for _, tt := range tests {
+		if got := pathUnderAny(tt.path, roots); got != tt.want {
+			t.Errorf("pathUnderAny(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+// argSeq reports whether `seq` appears as a contiguous subsequence in args.
+func argSeq(args []string, seq ...string) bool {
+	if len(seq) == 0 {
+		return true
+	}
+	for i := 0; i+len(seq) <= len(args); i++ {
+		match := true
+		for j, s := range seq {
+			if args[i+j] != s {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 func captureStderr(t *testing.T, fn func()) string {

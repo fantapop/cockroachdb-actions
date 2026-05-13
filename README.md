@@ -117,8 +117,14 @@ PROCEED or SKIP decision with reasoning.
 **Usage:**
 
 ```yaml
+# Check the target repo out into a subdirectory; the sandbox rejects
+# the workspace root itself. See the "autosolve sandbox" section below.
+- uses: actions/checkout@v6
+  with:
+    path: repo
 - uses: cockroachdb/actions/autosolve/assess@v0
   with:
+    working_directory: ./repo
     system_prompt: "Assess whether this issue can be resolved automatically."
     context_vars: "ISSUE_TITLE,ISSUE_BODY"
   env:
@@ -138,7 +144,8 @@ PROCEED or SKIP decision with reasoning.
 | `model`               | `claude-opus-4-6`    | Claude model ID                                                                                                                                       |
 | `blocked_paths`       | `""`                 | Comma-separated path prefixes that cannot be modified (case-sensitive). `.github/` is always blocked.                                                                 |
 | `log_level`           | `error`              | Controls Claude output in the step log: `error` (status only), `info` (result summary, permission denial warnings), `debug` (stream everything).     |
-| `working_directory`   | `.`                  | Directory to run in (relative to workspace root)                                                                                                      |
+| `working_directory`   | **required**         | Directory the action runs in (relative to `GITHUB_WORKSPACE`). Must be a strict subdirectory — the workspace root is rejected. See [autosolve sandbox](#autosolve-sandbox). |
+| `read_paths`          | `""`                 | Comma-separated extra host paths (files or directories) to bind read-only into the sandbox. See [autosolve sandbox](#autosolve-sandbox).            |
 
 **Outputs:**
 
@@ -164,8 +171,14 @@ enforcement, sensitive file detection, and token usage tracking.
 **Usage:**
 
 ```yaml
+# Check the target repo out into a subdirectory; the sandbox rejects
+# the workspace root itself. See the "autosolve sandbox" section below.
+- uses: actions/checkout@v6
+  with:
+    path: repo
 - uses: cockroachdb/actions/autosolve/implement@v0
   with:
+    working_directory: ./repo
     system_prompt: "Fix the issue described in the environment variables."
     context_vars: "ISSUE_TITLE,ISSUE_BODY"
     fork_owner: my-bot
@@ -204,7 +217,8 @@ enforcement, sensitive file detection, and token usage tracking.
 | `commit_signature`   | `Co-Authored-By: Claude <noreply@anthropic.com>` | Signature line appended to commit messages                                                        |
 | `pr_footer`          | [see below](#pr_footer-default)  | Footer appended to the PR body                                                                                   |
 | `log_level`          | `error`                          | Controls Claude output in the step log: `error` (status only), `info` (result summary, permission denial warnings), `debug` (stream everything). |
-| `working_directory`  | `.`                              | Directory to run in (relative to workspace root)                                                                 |
+| `working_directory`  | **required**                     | Directory the action runs in (relative to `GITHUB_WORKSPACE`). Must be a strict subdirectory — the workspace root is rejected. See [autosolve sandbox](#autosolve-sandbox). |
+| `read_paths`         | `""`                             | Comma-separated extra host paths (files or directories) to bind read-only into the sandbox. See [autosolve sandbox](#autosolve-sandbox). |
 
 <a id="allowed_tools-default"></a>
 > Default `allowed_tools`:
@@ -261,6 +275,45 @@ permission, the action logs a warning and creates the PR without labels.
 For organizations using SAML/SSO, if a classic token is used, it must be
 authorized for the organization that owns the target repository. See
 [GitHub docs on SSO authorization](https://docs.github.com/en/enterprise-cloud@latest/authentication/authenticating-with-saml-single-sign-on/authorizing-a-personal-access-token-for-use-with-saml-single-sign-on).
+
+<a id="autosolve-sandbox"></a>
+### autosolve sandbox
+
+Both `autosolve/assess` and `autosolve/implement` run Claude inside a
+[bubblewrap](https://github.com/containers/bubblewrap) filesystem sandbox
+that denies access to anything not explicitly bound. This blocks
+inadvertent reads of credentials or other repositories that earlier
+steps may have dropped into `GITHUB_WORKSPACE` or `RUNNER_TEMP`.
+
+**What's bound:**
+
+| Path                                       | Mode | Notes                                                                          |
+| ------------------------------------------ | ---- | ------------------------------------------------------------------------------ |
+| `working_directory`                        | RW   | Claude's cwd; the only writable host path you control.                         |
+| `read_paths`                               | RO   | Opt-in extras for shared schemas, generated protos, or other references.       |
+| `GOOGLE_APPLICATION_CREDENTIALS` (file)    | RO   | Auto-bound when set so Claude can refresh Vertex tokens.                       |
+| `/usr`, `/etc`, `/lib`, `/lib64`, `/opt`   | RO   | OS and tooling. Contains no per-user data.                                     |
+| `/run/systemd/resolve`                     | RO   | DNS resolver state (only when present). `/run` itself is **not** bound, so `/run/docker.sock` stays out of reach. |
+| Private `/tmp`                             | RW   | tmpfs; discarded after the run.                                                |
+
+Everything else is denied — including the workspace root, `RUNNER_TEMP`,
+`/home/runner`, ssh keys, and credential files dropped by other steps.
+
+**Caveats:**
+
+- **Linux only.** bubblewrap is Linux-only. The setup step disables
+  `kernel.apparmor_restrict_unprivileged_userns` so unprivileged user
+  namespaces work on Ubuntu 24.04+. This is fine on ephemeral hosted
+  runners; persistent self-hosted runners should evaluate the tradeoff
+  before adopting the action.
+- **`working_directory` must be a strict subdirectory** of
+  `GITHUB_WORKSPACE`. Check the target repo into a path like `./repo`
+  and pass `working_directory: ./repo`. The workspace root itself is
+  rejected because other actions (e.g. `google-github-actions/auth`)
+  drop credential files there.
+- **The host network namespace is shared** (`--share-net`). The sandbox
+  enforces filesystem isolation, not network isolation; Claude can
+  reach the same network the runner can.
 
 ### get-workflow-ref
 

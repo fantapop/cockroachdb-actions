@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -32,6 +33,28 @@ type Config struct {
 	//   "info"  — result summary (turns, duration, cost) and permission denial warnings
 	//   "debug" — all tool calls, assistant text, and tool I/O
 	LogLevel string
+
+	// ReadPaths are extra host paths to bind read-only into the sandbox.
+	// Use for shared schemas, generated protos, or other references the
+	// task needs to consult but not modify. Paths may be absolute or
+	// relative to GITHUB_WORKSPACE.
+	ReadPaths []string
+
+	// ScratchDir is the per-run sandbox scratch dir at
+	// $RUNNER_TEMP/autosolve-scratch (created by the action.yml setup
+	// step). Bound read-write into the sandbox; HOME points to its
+	// home/ subdir so claude session state persists across retries; the
+	// commit-message and pr-body subpaths are where claude writes the
+	// PR title/body coordination files.
+	ScratchDir string
+
+	// WorkingDir is the absolute path the binary runs in (set by the
+	// action.yml `working-directory:` step setting). Bound read-write
+	// into the sandbox and used as Claude's cwd. Must be a strict
+	// subdirectory of GITHUB_WORKSPACE — never the workspace root, since
+	// other actions (e.g. google-github-actions/auth) drop credential
+	// files there.
+	WorkingDir string
 
 	// Implementation-specific
 	MaxRetries   int
@@ -63,6 +86,10 @@ func LoadAssessConfig() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	sandbox, err := loadSandboxConfig()
+	if err != nil {
+		return nil, err
+	}
 	c := &Config{
 		SystemPrompt:       os.Getenv("INPUT_SYSTEM_PROMPT"),
 		Skill:              os.Getenv("INPUT_SKILL"),
@@ -72,6 +99,9 @@ func LoadAssessConfig() (*Config, error) {
 		BlockedPaths:       ParseBlockedPaths(os.Getenv("INPUT_BLOCKED_PATHS")),
 		FooterType:         "assessment",
 		LogLevel:           logLevel,
+		ReadPaths:          sandbox.readPaths,
+		ScratchDir:         sandbox.scratchDir,
+		WorkingDir:         sandbox.workingDir,
 
 		GithubRepository: os.Getenv("GITHUB_REPOSITORY"),
 	}
@@ -91,6 +121,10 @@ func LoadImplementConfig() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	sandbox, err := loadSandboxConfig()
+	if err != nil {
+		return nil, err
+	}
 
 	c := &Config{
 		SystemPrompt:    os.Getenv("INPUT_SYSTEM_PROMPT"),
@@ -100,6 +134,9 @@ func LoadImplementConfig() (*Config, error) {
 		BlockedPaths:    ParseBlockedPaths(os.Getenv("INPUT_BLOCKED_PATHS")),
 		FooterType:      "implementation",
 		LogLevel:        logLevel,
+		ReadPaths:       sandbox.readPaths,
+		ScratchDir:      sandbox.scratchDir,
+		WorkingDir:      sandbox.workingDir,
 		MaxRetries:      envOrDefaultInt("INPUT_MAX_RETRIES", 3),
 		AllowedTools:    envOrDefault("INPUT_ALLOWED_TOOLS", "Read,Write,Edit,Grep,Glob,Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(go build:*),Bash(go test:*),Bash(go vet:*),Bash(make:*)"),
 		ForkOwner:       os.Getenv("INPUT_FORK_OWNER"),
@@ -221,6 +258,112 @@ func ParseBlockedPaths(raw string) []string {
 // security review.
 func (c *Config) SecurityReviewModel() string {
 	return "claude-sonnet-4-6"
+}
+
+// sandboxInputs is the parsed/validated set of inputs that determine the
+// bubblewrap bind layout. Loaded once per Config so both subcommands share
+// the same validation rules.
+type sandboxInputs struct {
+	workingDir string   // absolute path; subdir of GITHUB_WORKSPACE
+	scratchDir string   // absolute path; $RUNNER_TEMP/autosolve-scratch
+	readPaths  []string // absolute paths; resolved against GITHUB_WORKSPACE
+}
+
+const scratchDirName = "autosolve-scratch"
+
+// loadSandboxConfig validates the inputs that determine the sandbox bind
+// layout. It enforces that the working directory is a strict subdirectory
+// of GITHUB_WORKSPACE — never the workspace root, since other actions
+// drop credential files there. Additional read paths are resolved against
+// GITHUB_WORKSPACE if relative.
+func loadSandboxConfig() (sandboxInputs, error) {
+	var s sandboxInputs
+
+	workspace := os.Getenv("GITHUB_WORKSPACE")
+	if workspace == "" {
+		return s, fmt.Errorf("GITHUB_WORKSPACE must be set")
+	}
+	absWorkspace, err := resolvePath(workspace)
+	if err != nil {
+		return s, fmt.Errorf("resolving GITHUB_WORKSPACE: %w", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return s, fmt.Errorf("determining working directory: %w", err)
+	}
+	absCwd, err := resolvePath(cwd)
+	if err != nil {
+		return s, fmt.Errorf("resolving working directory: %w", err)
+	}
+	if absCwd == absWorkspace {
+		return s, fmt.Errorf("working_directory must be a subdirectory of GITHUB_WORKSPACE, not the workspace root itself: check the target repo out into a subdirectory (e.g. ./repo) and set working_directory to that path")
+	}
+	if !strings.HasPrefix(absCwd, absWorkspace+string(filepath.Separator)) {
+		return s, fmt.Errorf("working_directory %q must be a subdirectory of GITHUB_WORKSPACE %q", absCwd, absWorkspace)
+	}
+	s.workingDir = absCwd
+
+	runnerTemp := os.Getenv("RUNNER_TEMP")
+	if runnerTemp == "" {
+		return s, fmt.Errorf("RUNNER_TEMP must be set")
+	}
+	absRunnerTemp, err := resolvePath(runnerTemp)
+	if err != nil {
+		return s, fmt.Errorf("resolving RUNNER_TEMP: %w", err)
+	}
+	s.scratchDir = filepath.Join(absRunnerTemp, scratchDirName)
+
+	raw := os.Getenv("INPUT_READ_PATHS")
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(absWorkspace, p)
+		}
+		abs, err := resolvePath(p)
+		if err != nil {
+			return s, fmt.Errorf("resolving read_paths entry %q: %w", p, err)
+		}
+		s.readPaths = append(s.readPaths, abs)
+	}
+
+	// Auto-bind GOOGLE_APPLICATION_CREDENTIALS read-only when set, so the
+	// in-sandbox Claude process can refresh Vertex tokens without the
+	// caller having to list it in read_paths. With workload
+	// identity federation the file is a federation config tied to
+	// short-lived per-runner OIDC tokens, so the residual blast radius
+	// is bounded.
+	if creds := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); creds != "" {
+		abs, err := resolvePath(creds)
+		if err != nil {
+			return s, fmt.Errorf("resolving GOOGLE_APPLICATION_CREDENTIALS %q: %w", creds, err)
+		}
+		s.readPaths = append(s.readPaths, abs)
+	}
+
+	return s, nil
+}
+
+// resolvePath returns an absolute, symlink-resolved path. We use
+// filepath.EvalSymlinks so that comparisons (e.g. cwd-under-workspace)
+// work even when the caller passes one form of a symlinked path and we
+// observe the other (commonly seen on macOS where /var → /private/var).
+// EvalSymlinks requires the path to exist, which is fine for our inputs:
+// GITHUB_WORKSPACE, RUNNER_TEMP, and read_paths must all
+// exist for the bind mounts to work anyway.
+func resolvePath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
 }
 
 func parseLogLevel(raw string) (string, error) {

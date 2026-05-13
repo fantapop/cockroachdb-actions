@@ -55,9 +55,27 @@ inputs:
     required: false
     default: "error"
   working_directory:
-    description: Directory to run in (relative to workspace root). Defaults to workspace root.
+    description: >
+      Directory the action runs in, relative to GITHUB_WORKSPACE. Required.
+      Must be a strict subdirectory of GITHUB_WORKSPACE — the workspace
+      root itself is rejected because other actions (e.g.
+      google-github-actions/auth) drop credential files there. Check the
+      target repo out into a subdirectory like ./repo and set
+      working_directory to that path. This directory is the only
+      caller-controlled writable location bound into the bubblewrap
+      sandbox; Claude additionally gets a private writable /tmp
+      (tmpfs, discarded after the run).
+    required: true
+  read_paths:
+    description: >
+      Comma-separated extra host paths (files or directories) to bind
+      read-only into the sandbox. Use for shared schemas, generated
+      protos, or other references the task needs to consult but not
+      modify. Paths may be absolute or relative to GITHUB_WORKSPACE.
+      The file referenced by GOOGLE_APPLICATION_CREDENTIALS, if set,
+      is auto-bound and does not need to be listed here.
     required: false
-    default: "."
+    default: ""
 
 outputs:
   assessment:
@@ -73,6 +91,22 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Set up sandbox
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" != "Linux" ]]; then
+          echo "::error::autosolve requires Linux runners (the sandbox uses bubblewrap, which is Linux-only)"
+          exit 1
+        fi
+        sudo apt-get update
+        sudo apt-get install --yes bubblewrap
+        # Ubuntu 24.04+ restricts unprivileged user namespaces by default,
+        # which blocks bwrap's uid mapping. Disabling this on an ephemeral
+        # hosted runner is acceptable; persistent self-hosted runners
+        # should evaluate the tradeoff before adopting this action.
+        sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+        mkdir -p "$RUNNER_TEMP/autosolve-scratch/home"
+
     - name: Set up Claude CLI
       shell: bash
       run: |
@@ -125,3 +159,4 @@ runs:
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_BLOCKED_PATHS: ${{ inputs.blocked_paths }}
         INPUT_LOG_LEVEL: ${{ inputs.log_level }}
+        INPUT_READ_PATHS: ${{ inputs.read_paths }}

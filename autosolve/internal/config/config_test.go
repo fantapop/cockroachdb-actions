@@ -2,6 +2,9 @@ package config
 
 import (
 	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +104,100 @@ func TestValidateAuth_NotEnabled(t *testing.T) {
 	}
 }
 
+func TestLoadSandboxConfig_RejectsWorkspaceRoot(t *testing.T) {
+	clearInputEnv(t)
+	// setupSandboxEnv (called via clearInputEnv) puts cwd at workspace/repo.
+	// Move cwd up to GITHUB_WORKSPACE itself; load should reject this.
+	if err := os.Chdir(os.Getenv("GITHUB_WORKSPACE")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INPUT_SYSTEM_PROMPT", "fix")
+	t.Setenv("INPUT_MODEL", "claude-opus-4-6")
+
+	_, err := LoadAssessConfig()
+	if err == nil {
+		t.Fatal("expected error when cwd is GITHUB_WORKSPACE")
+	}
+	if !strings.Contains(err.Error(), "subdirectory") {
+		t.Errorf("expected error mentioning subdirectory; got: %v", err)
+	}
+}
+
+func TestLoadSandboxConfig_RejectsCwdOutsideWorkspace(t *testing.T) {
+	clearInputEnv(t)
+	// Move cwd outside GITHUB_WORKSPACE.
+	outside := t.TempDir()
+	if err := os.Chdir(outside); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INPUT_SYSTEM_PROMPT", "fix")
+	t.Setenv("INPUT_MODEL", "claude-opus-4-6")
+
+	_, err := LoadAssessConfig()
+	if err == nil {
+		t.Fatal("expected error when cwd is outside GITHUB_WORKSPACE")
+	}
+}
+
+func TestLoadSandboxConfig_PopulatesPaths(t *testing.T) {
+	clearInputEnv(t)
+	t.Setenv("INPUT_SYSTEM_PROMPT", "fix")
+	t.Setenv("INPUT_MODEL", "claude-opus-4-6")
+
+	// Both an absolute path and a workspace-relative path should resolve.
+	abs := t.TempDir()
+	t.Setenv("INPUT_READ_PATHS", abs+", repo")
+
+	cfg, err := LoadAssessConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WorkingDir == "" {
+		t.Error("expected WorkingDir to be populated")
+	}
+	if cfg.ScratchDir == "" {
+		t.Error("expected ScratchDir to be populated")
+	}
+	if !strings.HasSuffix(cfg.ScratchDir, "autosolve-scratch") {
+		t.Errorf("expected scratch dir to be under RUNNER_TEMP/autosolve-scratch; got %q", cfg.ScratchDir)
+	}
+	if len(cfg.ReadPaths) != 2 {
+		t.Fatalf("expected 2 additional read paths; got %v", cfg.ReadPaths)
+	}
+	for _, p := range cfg.ReadPaths {
+		if !filepath.IsAbs(p) {
+			t.Errorf("expected absolute additional read path; got %q", p)
+		}
+	}
+}
+
+func TestLoadSandboxConfig_AutoBindsApplicationCredentials(t *testing.T) {
+	clearInputEnv(t)
+	t.Setenv("INPUT_SYSTEM_PROMPT", "fix")
+	t.Setenv("INPUT_MODEL", "claude-opus-4-6")
+
+	credsDir := t.TempDir()
+	credsPath := filepath.Join(credsDir, "gha-creds-abc.json")
+	if err := os.WriteFile(credsPath, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credsPath)
+
+	cfg, err := LoadAssessConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolvedCreds, err := filepath.EvalSymlinks(credsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(cfg.ReadPaths, resolvedCreds) {
+		t.Errorf("expected GOOGLE_APPLICATION_CREDENTIALS %q to be auto-bound; got %v",
+			resolvedCreds, cfg.ReadPaths)
+	}
+}
+
 func TestParseBlockedPaths(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -173,10 +270,43 @@ func clearInputEnv(t *testing.T) {
 		"INPUT_BLOCKED_PATHS", "INPUT_MAX_RETRIES", "INPUT_ALLOWED_TOOLS",
 		"INPUT_FORK_OWNER", "INPUT_FORK_REPO",
 		"INPUT_FORK_PUSH_TOKEN", "INPUT_PR_CREATE_TOKEN",
+		"INPUT_READ_PATHS",
 	} {
 		t.Setenv(key, "")
 		os.Unsetenv(key)
 	}
+	setupSandboxEnv(t)
+}
+
+// setupSandboxEnv arranges a valid sandbox environment for config loading:
+// a temp GITHUB_WORKSPACE, a sibling RUNNER_TEMP, and a subdirectory of
+// the workspace as cwd (so the workspace-root rejection rule passes).
+func setupSandboxEnv(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	runnerTemp := filepath.Join(root, "runner-temp")
+	repo := filepath.Join(workspace, "repo")
+	for _, p := range []string{workspace, runnerTemp, repo} {
+		if err := os.MkdirAll(p, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GITHUB_WORKSPACE", workspace)
+	t.Setenv("RUNNER_TEMP", runnerTemp)
+	// Clear any inherited creds env var so the auto-bind path doesn't add an
+	// extra read path that the test isn't expecting.
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	os.Unsetenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repo); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
 }
 
 func clearAuthEnv(t *testing.T) {

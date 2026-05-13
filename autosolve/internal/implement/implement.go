@@ -36,6 +36,17 @@ func Run(
 	// Warn if the repo is missing recommended .gitignore patterns
 	security.CheckGitignore(action.LogWarning)
 
+	// Tell claude (via env vars + printenv permissions added below) where
+	// to write the commit message and PR body. Both paths live in the
+	// scratch dir, outside the repo, so they can never be accidentally
+	// staged into a commit.
+	if err := os.Setenv("AUTOSOLVE_COMMIT_MESSAGE_PATH", commitMessagePath(cfg)); err != nil {
+		return fmt.Errorf("setting AUTOSOLVE_COMMIT_MESSAGE_PATH: %w", err)
+	}
+	if err := os.Setenv("AUTOSOLVE_PR_BODY_PATH", prBodyPath(cfg)); err != nil {
+		return fmt.Errorf("setting AUTOSOLVE_PR_BODY_PATH: %w", err)
+	}
+
 	// Pre-compute branch name so we can check for conflicts before
 	// spending tokens on Claude.
 	suffix := cfg.BranchSuffix
@@ -75,15 +86,17 @@ func Run(
 		action.LogInfo(fmt.Sprintf("--- Attempt %d of %d ---", attempt, cfg.MaxRetries))
 
 		// Append printenv permissions for each context var so Claude can
-		// read them without unrestricted Bash access.
-		var extraTools []string
+		// read them without unrestricted Bash access. Always permit
+		// reading the autosolve coordination paths so Claude can find
+		// the commit-message and pr-body destinations.
+		extraTools := []string{
+			"Bash(printenv AUTOSOLVE_COMMIT_MESSAGE_PATH)",
+			"Bash(printenv AUTOSOLVE_PR_BODY_PATH)",
+		}
 		for _, v := range cfg.ContextVars {
 			extraTools = append(extraTools, fmt.Sprintf("Bash(printenv %s)", v))
 		}
-		allowedTools := cfg.AllowedTools
-		if len(extraTools) > 0 {
-			allowedTools += "," + strings.Join(extraTools, ",")
-		}
+		allowedTools := cfg.AllowedTools + "," + strings.Join(extraTools, ",")
 
 		opts := claude.RunOptions{
 			Model:        cfg.Model,
@@ -92,6 +105,11 @@ func Run(
 			OutputFile:   outputFile,
 			ContextVars:  cfg.ContextVars,
 			LogLevel:     cfg.LogLevel,
+			Sandbox: &claude.SandboxOptions{
+				WorkingDir: cfg.WorkingDir,
+				ScratchDir: cfg.ScratchDir,
+				ReadPaths:  cfg.ReadPaths,
+			},
 		}
 
 		if attempt == 1 {
@@ -132,15 +150,15 @@ func Run(
 		action.LogInfo(resultText)
 
 		if positive {
-			// Claude must write .autosolve-commit-message. Treat a missing
-			// file as an incomplete attempt so we retry rather than falling
-			// back to a low-quality commit message.
-			if _, statErr := os.Stat(".autosolve-commit-message"); statErr != nil {
-				action.LogWarning(fmt.Sprintf("Attempt %d succeeded but .autosolve-commit-message was not written - retrying", attempt))
+			// Claude must write the commit message and PR body to the
+			// scratch dir. Treat a missing file as an incomplete attempt so
+			// we retry rather than falling back to a low-quality message.
+			if _, statErr := os.Stat(commitMessagePath(cfg)); statErr != nil {
+				action.LogWarning(fmt.Sprintf("Attempt %d succeeded but commit-message was not written - retrying", attempt))
 				continue
 			}
-			if _, statErr := os.Stat(".autosolve-pr-body"); statErr != nil {
-				action.LogWarning(fmt.Sprintf("Attempt %d succeeded but .autosolve-pr-body was not written - retrying", attempt))
+			if _, statErr := os.Stat(prBodyPath(cfg)); statErr != nil {
+				action.LogWarning(fmt.Sprintf("Attempt %d succeeded but pr-body was not written - retrying", attempt))
 				continue
 			}
 			action.LogNotice(fmt.Sprintf("Implementation succeeded on attempt %d", attempt))
@@ -187,7 +205,7 @@ func Run(
 			_ = writeOutputs("FAILED", "", "", resultText, &tracker)
 			return fmt.Errorf("PR creation failed: %w", err)
 		}
-		commitSubject, commitBody, err := stageChanges(gitClient, tmpDir)
+		commitSubject, commitBody, err := stageChanges(cfg, gitClient, tmpDir)
 		if err != nil {
 			_ = writeOutputs("FAILED", "", "", resultText, &tracker)
 			return fmt.Errorf("PR creation failed: %w", err)
@@ -274,13 +292,13 @@ func setupForkRemote(cfg *config.Config, gitClient git.Client, branchName string
 }
 
 func stageChanges(
-	gitClient git.Client, tmpDir string,
+	cfg *config.Config, gitClient git.Client, tmpDir string,
 ) (commitSubject, commitBody string, err error) {
-	commitSubject, commitBody, err = readCommitMessage()
+	commitSubject, commitBody, err = readCommitMessage(cfg)
 	if err != nil {
 		return "", "", err
 	}
-	if err := copyPRBody(tmpDir); err != nil {
+	if err := copyPRBody(cfg, tmpDir); err != nil {
 		return "", "", err
 	}
 
@@ -398,13 +416,27 @@ func createPR(
 	return prURL, nil
 }
 
-func readCommitMessage() (subject, body string, err error) {
-	data, err := os.ReadFile(".autosolve-commit-message")
+// commitMessagePath returns the scratch path where claude is told to
+// write the commit message. Lives outside the repo so it can never be
+// accidentally staged.
+func commitMessagePath(cfg *config.Config) string {
+	return filepath.Join(cfg.ScratchDir, "commit-message")
+}
+
+// prBodyPath returns the scratch path where claude is told to write the
+// PR body. Lives outside the repo so it can never be accidentally staged.
+func prBodyPath(cfg *config.Config) string {
+	return filepath.Join(cfg.ScratchDir, "pr-body")
+}
+
+func readCommitMessage(cfg *config.Config) (subject, body string, err error) {
+	path := commitMessagePath(cfg)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", "", fmt.Errorf("reading commit message: %w", err)
 	}
 	// Fail hard: a stale file could interfere with later retry attempts.
-	if err := os.Remove(".autosolve-commit-message"); err != nil {
+	if err := os.Remove(path); err != nil {
 		return "", "", fmt.Errorf("removing commit message file: %w", err)
 	}
 
@@ -418,8 +450,9 @@ func readCommitMessage() (subject, body string, err error) {
 	return subject, body, nil
 }
 
-func copyPRBody(tmpDir string) error {
-	data, err := os.ReadFile(".autosolve-pr-body")
+func copyPRBody(cfg *config.Config, tmpDir string) error {
+	path := prBodyPath(cfg)
+	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -430,7 +463,7 @@ func copyPRBody(tmpDir string) error {
 		return fmt.Errorf("copying PR body: %w", err)
 	}
 	// Fail hard: a stale file could interfere with later retry attempts.
-	if err := os.Remove(".autosolve-pr-body"); err != nil {
+	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("removing PR body file: %w", err)
 	}
 	return nil
@@ -511,6 +544,11 @@ func aiSecurityReview(
 		MaxTurns:     100,
 		Prompt:       securityReviewPrompt,
 		OutputFile:   outputFile,
+		Sandbox: &claude.SandboxOptions{
+			WorkingDir: cfg.WorkingDir,
+			ScratchDir: cfg.ScratchDir,
+			ReadPaths:  cfg.ReadPaths,
+		},
 	})
 	if err != nil {
 		// Best-effort unstage; safe to continue because the return

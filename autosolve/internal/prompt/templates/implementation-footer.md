@@ -27,13 +27,17 @@ Implement the task described above.
    Do NOT stage files matching: gha-creds-*.json, *.pem, *.key, *.p12,
    credentials.json, service-account*.json, or .env files. If you see
    these files in the working tree, leave them unstaged.
-8. Write a commit message and save it to `.autosolve-commit-message` in
-   the repo root. Use standard git format: a subject line (under 72
-   characters, imperative mood), a blank line, then a body explaining
-   what was changed and why. Since all changes go into a single commit,
-   the message should cover the full scope of the change. Focus on
-   helping a reviewer understand the commit — do NOT list individual
-   files. Example:
+8. Write a commit message to the path stored in the
+   `AUTOSOLVE_COMMIT_MESSAGE_PATH` environment variable. Read the path
+   with `printenv AUTOSOLVE_COMMIT_MESSAGE_PATH`, then use the Write
+   tool with that exact path. The path lives outside the repo on
+   purpose so the file can never be accidentally staged — do NOT write
+   it inside the working directory. Use standard git format: a subject
+   line (under 72 characters, imperative mood), a blank line, then a
+   body explaining what was changed and why. Since all changes go into
+   a single commit, the message should cover the full scope of the
+   change. Focus on helping a reviewer understand the commit — do NOT
+   list individual files. Example:
    ```
    Fix timeout in retry loop
 
@@ -43,10 +47,14 @@ Implement the task described above.
    with slow responses.
    ```
    If CLAUDE.md specifies a commit message format, follow that instead.
-9. Write a PR description and save it to `.autosolve-pr-body` in the repo
-   root. This will be used as the body of the pull request. The PR
-   description and commit message serve similar purposes for single-commit
-   PRs, but the PR description should be more reader-friendly. Include:
+9. Write a PR description to the path stored in the
+   `AUTOSOLVE_PR_BODY_PATH` environment variable. Read the path with
+   `printenv AUTOSOLVE_PR_BODY_PATH`, then use the Write tool with that
+   exact path. As with the commit message, this path is outside the
+   repo. This will be used as the body of the pull request. The PR
+   description and commit message serve similar purposes for
+   single-commit PRs, but the PR description should be more
+   reader-friendly. Include:
    - A brief summary of what was changed and why (2-3 sentences max).
    - What testing was done (tests added, tests run, manual verification).
    Do NOT include a list of changed files — reviewers can see that in the
